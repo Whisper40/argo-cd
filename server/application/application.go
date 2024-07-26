@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	kubecache "github.com/argoproj/gitops-engine/pkg/cache"
@@ -17,7 +18,7 @@ import (
 	"github.com/argoproj/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	"github.com/argoproj/gitops-engine/pkg/utils/text"
-	"github.com/argoproj/pkg/sync"
+	argosync "github.com/argoproj/pkg/sync"
 	jsonpatch "github.com/evanphx/json-patch"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -50,6 +51,7 @@ import (
 	"github.com/argoproj/argo-cd/v2/util/db"
 	"github.com/argoproj/argo-cd/v2/util/env"
 	"github.com/argoproj/argo-cd/v2/util/git"
+	"github.com/argoproj/argo-cd/v2/util/glob"
 	ioutil "github.com/argoproj/argo-cd/v2/util/io"
 	"github.com/argoproj/argo-cd/v2/util/lua"
 	"github.com/argoproj/argo-cd/v2/util/manifeststream"
@@ -65,6 +67,7 @@ type AppResourceTreeFn func(ctx context.Context, app *appv1.Application) (*appv1
 
 const (
 	maxPodLogsToRender                 = 10
+	maxGoroutinesForListApplication    = 50
 	backgroundPropagationPolicy string = "background"
 	foregroundPropagationPolicy string = "foreground"
 )
@@ -86,7 +89,7 @@ type Server struct {
 	kubectl           kube.Kubectl
 	db                db.ArgoDB
 	enf               *rbac.Enforcer
-	projectLock       sync.KeyLock
+	projectLock       argosync.KeyLock
 	auditLogger       *argo.AuditLogger
 	settingsMgr       *settings.SettingsManager
 	cache             *servercache.Cache
@@ -107,7 +110,7 @@ func NewServer(
 	kubectl kube.Kubectl,
 	db db.ArgoDB,
 	enf *rbac.Enforcer,
-	projectLock sync.KeyLock,
+	projectLock argosync.KeyLock,
 	settingsMgr *settings.SettingsManager,
 	projInformer cache.SharedIndexInformer,
 	enabledNamespaces []string,
@@ -262,6 +265,39 @@ func (s *Server) List(ctx context.Context, q *application.ApplicationQuery) (*ap
 		return nil, fmt.Errorf("error listing apps with selectors: %w", err)
 	}
 
+	// warm cache
+	_ = s.enf.LoadPolicy()
+
+	newItems := make([]appv1.Application, 0, len(apps))
+	var appMap sync.Map
+	semaphore := make(chan struct{}, maxGoroutinesForListApplication)
+	for idx, a := range apps {
+		semaphore <- struct{}{}
+
+		go func(idx int, a *appv1.Application) {
+			defer func() {
+				<-semaphore
+			}()
+
+			// Skip any application that is neither in the control plane's namespace
+			// nor in the list of enabled namespaces.
+			if a.Namespace != s.ns && !glob.MatchStringInList(s.enabledNamespaces, a.Namespace, false) {
+				return
+			}
+			if s.enf.Enforce(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionGet, a.RBACName(s.ns)) {
+				appMap.Store(idx, struct{}{})
+			}
+		}(idx, a)
+	}
+	for i := maxGoroutinesForListApplication; i > 0; i-- {
+		semaphore <- struct{}{}
+	}
+	appMap.Range(func(key, value interface{}) bool {
+		idx := key.(int)
+		newItems = append(newItems, *apps[idx])
+		return true
+	})
+
 	filteredApps := apps
 	// Filter applications by name
 	if q.Name != nil {
@@ -274,7 +310,7 @@ func (s *Server) List(ctx context.Context, q *application.ApplicationQuery) (*ap
 	// Filter applications by source repo URL
 	filteredApps = argoutil.FilterByRepoP(filteredApps, q.GetRepo())
 
-	newItems := make([]appv1.Application, 0)
+	newItems = make([]appv1.Application, 0)
 	for _, a := range filteredApps {
 		// Skip any application that is neither in the control plane's namespace
 		// nor in the list of enabled namespaces.

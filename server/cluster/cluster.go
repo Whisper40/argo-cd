@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"time"
+	"sync"
 
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	log "github.com/sirupsen/logrus"
@@ -22,6 +23,10 @@ import (
 	"github.com/argoproj/argo-cd/v2/util/clusterauth"
 	"github.com/argoproj/argo-cd/v2/util/db"
 	"github.com/argoproj/argo-cd/v2/util/rbac"
+)
+
+const (
+	maxGoroutinesForListCluster = 50
 )
 
 // Server provides a Cluster service
@@ -68,8 +73,34 @@ func (s *Server) List(ctx context.Context, q *cluster.ClusterQuery) (*appv1.Clus
 
 	// Filter clusters by server
 	filteredItems = filterClustersByServer(filteredItems, q.Server)
-
+	_ = s.enf.LoadPolicy()
 	items := make([]appv1.Cluster, 0)
+
+
+	semaphore := make(chan struct{}, maxGoroutinesForListCluster)
+	var clusterMap sync.Map
+	for idx := range clusterList.Items {
+		semaphore <- struct{}{}
+
+		go func(idx int, project, server string) {
+			defer func() {
+				<-semaphore
+			}()
+
+			if s.enf.Enforce(ctx.Value("claims"), rbacpolicy.ResourceClusters, rbacpolicy.ActionGet, CreateClusterRBACObject(project, server)) {
+				clusterMap.Store(idx, struct{}{})
+			}
+		}(idx, clusterList.Items[idx].Project, clusterList.Items[idx].Server)
+	}
+	for i := maxGoroutinesForListCluster; i > 0; i-- {
+		semaphore <- struct{}{}
+	}
+	clusterMap.Range(func(key, value interface{}) bool {
+		idx := key.(int)
+		items = append(items, clusterList.Items[idx])
+		return true
+	})
+	
 	for _, clust := range filteredItems {
 		if s.enf.Enforce(ctx.Value("claims"), rbacpolicy.ResourceClusters, rbacpolicy.ActionGet, CreateClusterRBACObject(clust.Project, clust.Server)) {
 			items = append(items, clust)
