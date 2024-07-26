@@ -100,7 +100,7 @@ func (e *Enforcer) getCasbinEnforcer(project string, policy string) CasbinEnforc
 
 // tryGetCabinEnforcer returns the cached enforcer for the given optional project and project policy.
 func (e *Enforcer) tryGetCasbinEnforcer(project string, policy string) (CasbinEnforcer, error) {
-	e.lock.Lock()
+	e.lock.RLock()
 	defer e.lock.RUnlock()
 
 	if project != "" && policy == "" {
